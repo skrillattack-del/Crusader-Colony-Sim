@@ -1,0 +1,10 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pkl
+*.pdf
+.vscode
+.idea
+*.md
+!README.md

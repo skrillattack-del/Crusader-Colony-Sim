@@ -141,7 +141,96 @@ The foundational rules shared by every entity and system:
 
 ## Development Status
 
-This project is in the design / pre-production phase. The document describes the intended architecture, mathematical foundations, and design goals. The document does not specify a current implementation language, build system, or release timeline.
+**Playable pure-Python vertical slice implemented** (stdlib only, zero dependencies).
+
+```
+main.py                  CLI entry (gui / headless / 3d modes)
+crusader/
+  engine.py              calendar clock, deterministic RNG, event bus, scheduler
+  worldgen.py            fBm value-noise continents, biomes, rivers, provinces
+  genetics.py            diploid allele traits, polygenic loci, inbreeding
+  pawn.py                B/K/M/C/S/R/I/G pawn model, personality, opinions
+  population.py          1000+ pawn daily utility AI, matchmaking, births, deaths
+  dynasty.py             houses, titles, CK3 succession laws, claims, elections
+  religion.py            faiths, tenets, doctrines, fervor, conversion
+  diplomacy.py           ruler opinions, alliances, casus belli, peace terms
+  war.py                 armies, terrain battles, full siege phases
+  economy.py             14 goods, supply/demand prices, taxes, buildings
+  tech.py                144 innovations (4 eras) + 30 combat-grammar techniques
+  crafting.py            83-recipe crafting DAG (raw -> component -> equipment)
+  dialogue.py            LLM dialogue (OpenAI-compatible, stdlib) + offline fallback
+  render2d.py            tkinter map viewer: biome/realm/faith/economy modes
+  render3d.py            software 3D renderer: animated low-poly knights
+  webserver.py           stdlib HTTP + JSON API, background sim thread
+  web/index.html         browser frontend (canvas map, chronicle, controls)
+```
+
+### Run it
+
+```bash
+python main.py --mode headless --pawns 1000 --years 20   # benchmark + chronicle
+python main.py --mode gui --pawns 1000                   # live 2D map (desktop)
+python main.py --mode 3d                                 # 3D animated battlefield
+python main.py --mode web --port 8080                    # browser UI + JSON API
+python main.py --mode headless --years 50 --save world.pkl
+python main.py --mode gui --load world.pkl
+```
+
+GUI keys: `b/r/f/e` map modes · `space` pause · `+/-` speed · `d` sample dialogue · click a province to inspect.
+
+LLM dialogue is optional: set `CCS_LLM_URL`, `CCS_LLM_KEY`, `CCS_LLM_MODEL`
+for any OpenAI-compatible endpoint; otherwise a personality-driven offline
+generator (trait templates + Markov chain) is used.
+
+Verified: 1000+ pawns at ~70-85 simulated days/s; succession, partition,
+holy wars, sieges, era progression and save/load round-trip all exercised
+over 20-year headless runs.
+
+---
+
+## Docker / Railway deployment
+
+The container runs the **web mode** (browser UI + JSON API). The desktop
+tkinter modes (`gui`, `3d`) are local-only — servers have no display.
+
+### Local Docker
+
+```bash
+docker build -t crusader-colony-sim .
+docker run -p 8080:8080 crusader-colony-sim
+# open http://localhost:8080
+```
+
+Useful env vars: `PORT` (default 8080), `PAWNS` (default 1000),
+`MAP_SIZE` (default 192), `DAYS_PER_SEC` (default 15),
+plus optional `CCS_LLM_URL` / `CCS_LLM_KEY` / `CCS_LLM_MODEL` for LLM dialogue.
+
+### Railway
+
+The repo includes `railway.toml` + `Dockerfile` — zero config needed:
+
+1. Push this folder to a GitHub repo.
+2. Railway dashboard → **New Project → Deploy from GitHub repo**.
+3. Railway auto-detects the Dockerfile, builds, and injects `$PORT`.
+4. Healthcheck runs against `/api/state` (configured in `railway.toml`).
+
+Or with the CLI: `railway up`.
+
+Note: the filesystem is ephemeral on Railway — `world.pkl` saves do not
+survive redeploys unless you attach a Volume and save there.
+
+### API
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /` | single-page map UI |
+| `GET /api/state` | world summary JSON (healthcheck) |
+| `GET /api/map?mode=biome\|realm\|faith\|economy` | palette + base64 tiles |
+| `GET /api/overlays` | armies, sieges, capitals |
+| `GET /api/chronicle?since=N` | event feed (incremental) |
+| `GET /api/province_xy?x=X&y=Y` | province detail |
+| `GET /api/dialogue` | sample NPC conversation |
+| `POST /api/control` | `{"action":"pause"\|"resume"\|"speed","value":N}` |
 
 ---
 
