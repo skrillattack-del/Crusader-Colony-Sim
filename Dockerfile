@@ -8,7 +8,10 @@ ENV PYTHONUNBUFFERED=1 \
     DAYS_PER_SEC=15
 
 WORKDIR /app
-COPY . .
+COPY backend/ ./backend/
+COPY frontend/ ./frontend/
+
+WORKDIR /app/backend
 
 # Railway injects $PORT; default to 8080 locally
 EXPOSE 8080
