@@ -163,8 +163,9 @@ backend/
     render2d.py          tkinter map viewer: biome/realm/faith/economy modes
     render3d.py          software 3D renderer: animated low-poly knights
     webserver.py         stdlib HTTP + JSON API, background sim thread
+    battle_sim.py        live tactical battles: soldiers, generals, duels, techniques
 frontend/
-  index.html             browser UI: canvas map, province/pawn inspector, chronicle
+  index.html             browser UI: canvas map, battle watcher, pawn inspector, chronicle
 Dockerfile               production image (serves frontend/ from backend/)
 railway.toml             Railway build + healthcheck config
 ```
@@ -189,6 +190,31 @@ generator (trait templates + Markov chain) is used.
 Verified: 1000+ pawns at ~70-85 simulated days/s; succession, partition,
 holy wars, sieges, era progression and save/load round-trip all exercised
 over 20-year headless runs.
+
+---
+
+## The Total War layer (live battles)
+
+In web mode, army clashes no longer resolve instantly — a **live tactical
+battle** spawns and runs in real time (tactical layer, ~10-30 Hz, independent
+of strategic speed):
+
+- up to 350 individually simulated soldiers per side (larger armies scaled),
+  spawned in formations: infantry ranks, archers behind, cavalry on flanks
+- unit-type tactics: archers fire at range, cavalry charges the flanks,
+  pikemen hold; damage/toughness flow from the strategic unit stats
+- **named generals** (the army commanders) with rally auras, who **duel each
+  other** when they meet — a slain general dies for real, and succession
+  fires mid-battle
+- generals who know combat-grammar techniques **unleash them as AoE blasts**
+  ("Gate of the Third Form — 28 men fall!")
+- side morale tracks casualties and general deaths; at breaking point the
+  army **routs**, survivors write back into the campaign layer, war score
+  applies, and the chronicle records the outcome
+
+Watch: a gold ✕ marker pulses on the campaign map where armies clash —
+click it (or the `⚔ Watch` button) to open the battlefield: unit dots,
+technique shockwaves, dueling generals with HP bars, morale bars, kill feed.
 
 ---
 
@@ -236,6 +262,8 @@ survive redeploys unless you attach a Volume and save there.
 | `GET /api/pawns?province=N` | pawns living in a province |
 | `GET /api/pawn?id=N` | full pawn sheet (genes, skills, needs, titles) |
 | `GET /api/pawn_say?id=N` | one in-character dialogue line |
+| `GET /api/battles` | live tactical battles (Total War layer) |
+| `GET /api/battle?id=N` | real-time battle snapshot: units, generals, fx, feed |
 | `GET /api/dialogue` | sample NPC conversation |
 | `POST /api/control` | `{"action":"pause"\|"resume"\|"speed","value":N}` |
 

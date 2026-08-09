@@ -182,6 +182,7 @@ class WarEngine:
         self.sim = sim
         self.armies: list[Army] = []
         self.sieges: list[Siege] = []
+        self.live_manager = None   # set by webserver -> live Total-War battles
 
     # ---- raising & moving ----
     def raise_army(self, ruler) -> Army:
@@ -248,7 +249,12 @@ class WarEngine:
             hostiles = [(a, b) for i, a in enumerate(group) for b in group[i + 1:]
                         if self.sim.diplomacy.at_war(a.ruler, b.ruler)]
             for a, b in hostiles:
-                self.resolve_battle(a, b, wm.provinces[pid])
+                if self.live_manager is not None:
+                    if not self.live_manager.has(a) and not self.live_manager.has(b):
+                        war = self.sim.diplomacy.war_between(a.ruler, b.ruler)
+                        self.live_manager.spawn(a, b, wm.provinces[pid], war)
+                else:
+                    self.resolve_battle(a, b, wm.provinces[pid])
         # sieges
         for s in list(self.sieges):
             if s.army not in self.armies or s.army.size <= 0:

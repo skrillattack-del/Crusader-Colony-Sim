@@ -60,6 +60,9 @@ class SimRunner:
         self.paused = False
         self.days_per_sec = days_per_sec
         self._stop = False
+        from .battle_sim import BattleManager
+        self.battles = BattleManager(sim)
+        sim.war_engine.live_manager = self.battles
 
     def start(self):
         threading.Thread(target=self._loop, daemon=True).start()
@@ -69,18 +72,18 @@ class SimRunner:
         last = time.perf_counter()
         while not self._stop:
             now = time.perf_counter()
-            acc += (now - last) * self.days_per_sec
+            real_dt = now - last
+            acc += real_dt * self.days_per_sec
             last = now
             n = int(acc)
             acc -= n
-            if self.paused or self.days_per_sec <= 0:
-                time.sleep(0.05)
-                continue
-            if n > 0:
-                with self.lock:
+            with self.lock:
+                # tactical layer always runs in real time (~10-30 Hz)
+                self.battles.tick(min(real_dt, 0.25))
+                if not self.paused and self.days_per_sec > 0 and n > 0:
                     for _ in range(min(n, 40)):
                         self.sim.tick()
-            else:
+            if n <= 0:
                 time.sleep(0.01)
 
 
@@ -148,7 +151,7 @@ def map_payload(sim, mode: str) -> dict:
             "tiles": base64.b64encode(bytes(data)).decode("ascii")}
 
 
-def overlays_payload(sim) -> dict:
+def overlays_payload(sim, battles=None) -> dict:
     pop = sim.population
     armies = []
     for a in sim.war_engine.armies:
@@ -170,7 +173,13 @@ def overlays_payload(sim) -> dict:
             capitals.append({"x": p.cx, "y": p.cy,
                              "name": t.name,
                              "ruler": holder.display_name() if holder else "?"})
-    return {"armies": armies, "sieges": sieges, "capitals": capitals}
+    fights = []
+    if battles is not None:
+        for b in battles.battles.values():
+            fights.append({"id": b.bid, "x": b.province.cx, "y": b.province.cy,
+                           "name": b.province.name, "phase": b.phase})
+    return {"armies": armies, "sieges": sieges, "capitals": capitals,
+            "fights": fights}
 
 
 def province_payload(sim, pid: int) -> dict | None:
@@ -288,7 +297,7 @@ def make_handler(runner: SimRunner):
                         self._json(map_payload(sim, mode))
                 elif url.path == "/api/overlays":
                     with runner.lock:
-                        self._json(overlays_payload(sim))
+                        self._json(overlays_payload(sim, runner.battles))
                 elif url.path == "/api/chronicle":
                     since = int(qs.get("since", ["0"])[0])
                     with runner.lock:
@@ -320,6 +329,14 @@ def make_handler(runner: SimRunner):
                             self._json(province_payload(sim, pid))
                         else:
                             self._json(None)
+                elif url.path == "/api/battles":
+                    with runner.lock:
+                        self._json({"battles": runner.battles.active()})
+                elif url.path == "/api/battle":
+                    bid = int(qs.get("id", ["-1"])[0])
+                    with runner.lock:
+                        b = runner.battles.get(bid)
+                        self._json(b.snapshot() if b else None)
                 elif url.path == "/api/pawns":
                     pid = int(qs.get("province", ["-1"])[0])
                     with runner.lock:
