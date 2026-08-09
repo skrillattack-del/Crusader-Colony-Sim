@@ -5,13 +5,17 @@ The simulation ticks on a background thread; the browser polls compact JSON
 
 Endpoints:
     GET  /                     single-page frontend
+    GET  /battle.js            battle viewer renderer (static)
     GET  /api/state            world summary
     GET  /api/map?mode=biome|realm|faith|economy
-    GET  /api/overlays         armies, sieges, capitals
+    GET  /api/overlays         armies, sieges, capitals, live fights
     GET  /api/chronicle?since=N
     GET  /api/dialogue         sample NPC conversation
     GET  /api/province?id=N    province detail
+    GET  /api/battles          brief list of live battles
+    GET  /api/battle?id=N      full battle snapshot (viewer payload)
     POST /api/control          {"action": "pause"|"resume"|"speed", "value": N}
+    POST /api/debug_battle     stage a demonstration battle (dev tool)
 """
 from __future__ import annotations
 
@@ -240,6 +244,7 @@ def pawn_detail(sim, p) -> dict:
         "traits_all": p.traits,
         "carriers": p.genome.carriers(),
         "techniques": p.techniques,
+        "wounds": p.wounds[-8:],
         "gold": round(p.gold, 1),
         "piety": round(p.piety, 1),
         "prestige": round(p.prestige, 1),
@@ -252,6 +257,42 @@ def pawn_detail(sim, p) -> dict:
         "claims": [sim.dynasties.titles[t].full_name
                    for t in p.claims if t in sim.dynasties.titles],
     }
+
+
+# ---------------- dev tools ----------------
+
+def stage_debug_battle(sim, battles) -> int:
+    """Stage a demonstration battle between two synthetic hosts led by the
+    world's fiercest living champions (granted a demo technique kit)."""
+    from .war import Army
+    pop = sim.population
+    engaged = {g.pawn.pid for b in battles.battles.values()
+               for g in b.generals}
+    living = [p for p in pop.living() if p.pid not in engaged]
+    if len(living) < 2:
+        raise RuntimeError("not enough living pawns to stage a battle")
+    living.sort(key=lambda p: -(p.skills["prowess"] * 2.0
+                                + p.prestige * 0.05
+                                + p.genome.poly_value("conduit_loci") * 10))
+    a, b = living[0], living[1]
+    kit_a = ["Gate of the First Form", "Gate of the Second Form",
+             "Gate of the Third Form", "Gate of the Fourth Form",
+             "Lion's Roar", "Thunder-Draw Iai"]
+    kit_b = ["Ashen Dragon Breath", "Gentle Meridian Tap",
+             "Crimson Blink Reap", "Ember Bloom Palm"]
+    for pawn, kit in ((a, kit_a), (b, kit_b)):
+        for name in kit:
+            if name not in pawn.techniques:
+                pawn.techniques.append(name)
+    army_a = Army(a.pid, a.province,
+                  {"levy": 250, "spearmen": 70, "archers": 55,
+                   "knights": 16, "light_cav": 28}, commander=a.pid)
+    army_b = Army(b.pid, b.province,
+                  {"levy": 240, "pikemen": 75, "archers": 60,
+                   "knights": 12, "light_cav": 30}, commander=b.pid)
+    prov = sim.world.provinces[a.province]
+    battle = battles.spawn(army_a, army_b, prov, None)
+    return battle.bid
 
 
 # ---------------- HTTP handler ----------------
@@ -285,6 +326,20 @@ def make_handler(runner: SimRunner):
                     self.send_header("Content-Length", str(len(html)))
                     self.end_headers()
                     self.wfile.write(html)
+                elif url.path.endswith(".js"):
+                    # static scripts beside index.html (no path traversal)
+                    f = WEB_DIR / Path(url.path).name
+                    if f.exists():
+                        body = f.read_bytes()
+                        self.send_response(200)
+                        self.send_header("Content-Type",
+                                         "application/javascript; "
+                                         "charset=utf-8")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    else:
+                        self._json({"error": "not found"}, 404)
                 elif url.path == "/api/state":
                     with runner.lock:
                         s = sim.summary()
@@ -372,7 +427,14 @@ def make_handler(runner: SimRunner):
                 self._json({"error": str(e)}, 500)
 
         def do_POST(self):
-            if self.path.startswith("/api/control"):
+            if self.path.startswith("/api/debug_battle"):
+                try:
+                    with runner.lock:
+                        bid = stage_debug_battle(sim, runner.battles)
+                    self._json({"id": bid})
+                except Exception as e:
+                    self._json({"error": str(e)}, 500)
+            elif self.path.startswith("/api/control"):
                 length = int(self.headers.get("Content-Length", 0))
                 try:
                     body = json.loads(self.rfile.read(length) or b"{}")

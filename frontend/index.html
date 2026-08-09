@@ -48,7 +48,7 @@
   .mbar > div { height:100%; transition:width .3s; }
   #bcanvas { flex:1; background:#1c2b1e; border-radius:6px; width:100%; }
   #battlefoot { display:flex; gap:12px; padding-top:8px; }
-  #killfeed { flex:1; height:84px; overflow-y:auto; font-family:Consolas,monospace;
+  #killfeed { flex:1; height:108px; overflow-y:auto; font-family:Consolas,monospace;
               font-size:11px; color:#b2bec3; }
   #bresult { font-size:15px; color:#f1c40f; align-self:center; }
   #bclose { align-self:flex-start; }
@@ -87,6 +87,7 @@
     <button id="faster">+</button>
     <button id="dlg">💬 Dialogue</button>
     <button id="watch">⚔ Watch <span id="bcount">0</span></button>
+    <button id="stage">⚡ Stage battle</button>
   </div>
   <div id="inspector">
     <div id="prov">click the map to inspect a province</div>
@@ -199,105 +200,9 @@ async function loadChronicle() {
 }
 
 // ---------- Total War battle viewer ----------
-let watchId = null, watchTimer = null, lastFights = [];
-const bc = document.getElementById('bcanvas');
-const bctx = bc.getContext('2d');
-
-async function openBattle(id) {
-  watchId = id;
-  document.getElementById('battlewrap').style.display = 'flex';
-  if (watchTimer) clearInterval(watchTimer);
-  watchTimer = setInterval(drawBattle, 250);
-  drawBattle();
-}
-function closeBattle() {
-  watchId = null;
-  document.getElementById('battlewrap').style.display = 'none';
-  if (watchTimer) clearInterval(watchTimer);
-}
-document.getElementById('bclose').onclick = closeBattle;
-document.getElementById('watch').onclick = async () => {
-  const r = await fetch('/api/battles');
-  const d = await r.json();
-  if (d.battles.length) openBattle(d.battles[d.battles.length - 1].id);
-  else {
-    const box = document.getElementById('chron');
-    const el = document.createElement('div');
-    el.textContent = '—— no live battles right now; wait for armies to clash ——';
-    box.appendChild(el);
-    box.scrollTop = box.scrollHeight;
-  }
-};
-
-async function drawBattle() {
-  if (watchId === null) return;
-  const r = await fetch('/api/battle?id=' + watchId);
-  const b = await r.json();
-  if (!b) { closeBattle(); return; }
-  document.getElementById('s0name').textContent = b.sides[0].name;
-  document.getElementById('s1name').textContent = b.sides[1].name;
-  document.getElementById('s0morale').style.width = (b.sides[0].morale * 100) + '%';
-  document.getElementById('s1morale').style.width = (b.sides[1].morale * 100) + '%';
-  document.getElementById('s0count').textContent =
-    b.sides[0].count + '/' + b.sides[0].initial;
-  document.getElementById('s1count').textContent =
-    b.sides[1].count + '/' + b.sides[1].initial;
-
-  const W = bc.width, H = bc.height;
-  const sx = W / 120, sy = H / 70;
-  const px = x => (x + 60) * sx, py = y => (y + 35) * sy;
-  bctx.fillStyle = '#1c2b1e';
-  bctx.fillRect(0, 0, W, H);
-  // soldiers
-  for (const u of b.units) {
-    const side = u[0], x = u[2], y = u[3], hp = u[4];
-    bctx.fillStyle = side === 0 ? '#ff6b6b' : '#74b9ff';
-    bctx.globalAlpha = 0.35 + 0.65 * hp;
-    bctx.fillRect(px(x) - 1.6, py(y) - 1.6, 3.2, 3.2);
-  }
-  bctx.globalAlpha = 1;
-  // technique blasts
-  for (const f of b.fx) {
-    bctx.strokeStyle = f.side === 0 ? '#ffd6cc' : '#cfe6ff';
-    bctx.globalAlpha = Math.max(0, 1 - f.age / 1.6);
-    bctx.lineWidth = 2.5;
-    bctx.beginPath();
-    bctx.arc(px(f.x), py(f.y), f.r * sx * (0.4 + f.age), 0, 6.283);
-    bctx.stroke();
-  }
-  bctx.globalAlpha = 1;
-  // generals: gold diamond + name + hp bar
-  for (const g of b.generals) {
-    if (!g.alive) continue;
-    const gx = px(g.x), gy = py(g.y);
-    bctx.fillStyle = '#f1c40f';
-    bctx.beginPath();
-    bctx.moveTo(gx, gy - 6); bctx.lineTo(gx + 6, gy);
-    bctx.lineTo(gx, gy + 6); bctx.lineTo(gx - 6, gy);
-    bctx.fill();
-    if (g.dueling) {
-      bctx.strokeStyle = '#fff';
-      bctx.lineWidth = 1.5;
-      bctx.beginPath(); bctx.arc(gx, gy, 10, 0, 6.283); bctx.stroke();
-    }
-    bctx.fillStyle = '#101820';
-    bctx.fillRect(gx - 20, gy - 18, 40, 4);
-    bctx.fillStyle = g.side === 0 ? '#ff6b6b' : '#74b9ff';
-    bctx.fillRect(gx - 20, gy - 18, 40 * g.hp, 4);
-    bctx.fillStyle = '#fff';
-    bctx.font = '10px sans-serif';
-    bctx.textAlign = 'center';
-    bctx.fillText(g.name, gx, gy - 22);
-  }
-  // kill feed
-  const feed = document.getElementById('killfeed');
-  feed.innerHTML = b.events.slice().reverse()
-    .map(e => '<div>' + e + '</div>').join('');
-  document.getElementById('bresult').textContent = b.result
-    ? `⚑ ${b.result.winner} holds the field — ` +
-      `${b.result.kills[0] + b.result.kills[1]} casualties`
-    : `${b.phase}  ·  ${b.t}s`;
-}
+// The animated viewer lives in /battle.js (loaded below); it exposes
+// window.openBattle(id) / window.closeBattle() and owns #bcanvas.
+let lastFights = [];
 
 // ---------- province + pawn inspector ----------
 cv.addEventListener('click', async (ev) => {
@@ -350,6 +255,7 @@ async function showPawn(pid) {
     `personality: ${p.personality.join(', ')}\n` +
     `traits: ${p.traits_all.join(', ') || '—'}` +
     `${p.carriers.length ? '\ncarries: ' + p.carriers.join(', ') : ''}\n` +
+    `${(p.wounds || []).length ? 'wounds: ' + p.wounds.join(', ') + '\n' : ''}` +
     `${skills}\nneeds: ${needs}\n` +
     `${p.techniques.length ? 'techniques: ' + p.techniques.join(', ') + '\n' : ''}` +
     `${p.spouse ? 'spouse: ' + p.spouse + '\n' : ''}` +
@@ -419,5 +325,6 @@ setInterval(loadOverlays, 2000);
 setInterval(loadState, 2000);
 setInterval(loadChronicle, 1500);
 </script>
+<script src="/battle.js"></script>
 </body>
 </html>
