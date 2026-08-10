@@ -24,6 +24,17 @@
   let fxSeen = new Map();              // fx key -> expiry
   let shake = 0;
   let lastPhase = '', phaseAt = -1e9, phaseLabel = '';
+  // animation pass: particles, weapon trails, death/fall tracking, UI tweens
+  let particles = [];                  // {x,y,vx,vy,life,max,col,size,grav,world,spin,rot}
+  let trails = new Map();              // id -> [{x,y,born}] recent blade-tip screen pts
+  let falling = new Map();             // id -> {x,y,face,h,col,dead,born} mid-fall figures
+  let lastUnit = new Map();            // uid -> {side,type,hp,face} last known (for fall fig)
+  let prevUids = new Set();            // detect vanished units (deaths)
+  let prevGenDown = [];                // detect generals going down
+  let prevMorale = [null, null];       // morale-change flash
+  let moraleFlash = [0, 0];            // timestamp of last morale change
+  let resultAt = -1e9;                 // result-overlay appear time
+  let lastNow = 0;                     // dt for particle physics
   const POLL_MS = 100;
 
   // ------------------------------------------------------------ palette
@@ -49,6 +60,131 @@
   const lerp = (a, b, t) => a + (b - a) * t;
   const easeOut = t => 1 - Math.pow(1 - t, 3);
   const easeIn = t => t * t * t;
+  const easeOutCubic = easeOut;
+  const easeOutQuint = t => 1 - Math.pow(1 - t, 5);
+  const easeInOutCubic = t => t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2;
+  const easeOutBack = t => {
+    const c1 = 1.70158, c3 = c1 + 1;
+    return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+  };
+
+  // ----- particle system: blood, dust, sparks, debris -----
+  function spawnParticles(wx, wy, n, opt) {
+    const o = opt || {};
+    const col = o.col || '#b03030';
+    for (let i = 0; i < n; i++) {
+      const a = o.dir !== undefined
+        ? o.dir + (Math.random() - 0.5) * (o.spread || 1.2)
+        : Math.random() * 6.283;
+      const sp = (o.spd || 1) * (0.4 + Math.random() * 0.9);
+      particles.push({
+        x: wx, y: wy,
+        vx: Math.cos(a) * sp + (o.vx || 0),
+        vy: Math.sin(a) * sp + (o.vy || 0),
+        life: o.life || 0.7, max: o.life || 0.7,
+        col, size: o.size || (0.8 + Math.random() * 1.2),
+        grav: o.grav !== undefined ? o.grav : 14,
+        world: o.world !== false,         // true = coords in world space (px/py)
+        spin: (Math.random() - 0.5) * 8, rot: Math.random() * 6.283,
+        drag: o.drag !== undefined ? o.drag : 1.6,
+        glow: o.glow || false,
+      });
+    }
+    if (particles.length > 520) particles.splice(0, particles.length - 520);
+  }
+
+  function updateParticles(dt, px, py, sc, now, ctx) {
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.life -= dt;
+      if (p.life <= 0) { particles.splice(i, 1); continue; }
+      p.vy += p.grav * dt;
+      p.vx -= p.vx * p.drag * dt;
+      p.vy -= p.vy * p.drag * 0.4 * dt;
+      p.x += p.vx * dt * 18;
+      p.y += p.vy * dt * 18;
+      p.rot += p.spin * dt;
+    }
+    // draw
+    for (const p of particles) {
+      const sx = p.world ? px(p.x) : p.x;
+      const sy = p.world ? py(p.y) : p.y;
+      const t = p.life / p.max;
+      ctx.globalAlpha = clamp(t, 0, 1);
+      const r = p.size * sc * (0.6 + t * 0.6);
+      if (p.glow) {
+        ctx.fillStyle = p.col;
+        ctx.beginPath(); ctx.arc(sx, sy, r * 1.6, 0, 6.283);
+        ctx.globalAlpha = clamp(t, 0, 1) * 0.4; ctx.fill();
+        ctx.globalAlpha = clamp(t, 0, 1);
+      }
+      ctx.fillStyle = p.col;
+      ctx.beginPath(); ctx.arc(sx, sy, r, 0, 6.283); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ----- weapon trails: ribbon of recent blade-tip screen positions -----
+  const TRAIL_LIFE = 160;              // ms
+  function pushTrail(id, sx, sy, now) {
+    let arr = trails.get(id);
+    if (!arr) { arr = []; trails.set(id, arr); }
+    arr.push({ x: sx, y: sy, born: now });
+    if (arr.length > 14) arr.shift();
+  }
+  function drawTrails(ctx, now, sc, pred) {
+    for (const [id, arr] of trails) {
+      if (pred && !pred(id)) continue;
+      if (arr.length < 2) continue;
+      for (let i = 1; i < arr.length; i++) {
+        const a = arr[i - 1], b = arr[i];
+        const age = now - b.born;
+        if (age > TRAIL_LIFE) continue;
+        const t = 1 - age / TRAIL_LIFE;
+        ctx.strokeStyle = `rgba(240,248,255,${0.55 * t * t})`;
+        ctx.lineWidth = (1 + t * 2.4) * sc;
+        ctx.lineCap = 'round';
+        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+      }
+      while (arr.length && now - arr[0].born > TRAIL_LIFE) arr.shift();
+    }
+  }
+
+  // ----- falling figures: bridge standing -> down/corpse over ~0.5s -----
+  function drawFalling(ctx, fx, fy, h, face, col, born, now) {
+    const t = clamp((now - born) / 500, 0, 1);
+    if (t >= 1) return false;            // done -> caller shows persistent corpse
+    const e = easeOutCubic(t);
+    const cx = fx, cy = fy;
+    const standHipY = cy - h * 0.42, standChestY = cy - h * 0.72;
+    // collapse: hip & chest drop toward ground, torso rotates to horizontal
+    const hipY = lerp(standHipY, cy - h * 0.06, e);
+    const chestY = lerp(standChestY, cy - h * 0.10, e);
+    const lean = e * 1.3 * face;          // topple forward
+    const chestX = cx + Math.sin(lean) * h * 0.30;
+    ctx.save();
+    ctx.globalAlpha = 1 - e * 0.25;
+    ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineCap = 'round';
+    const lw = Math.max(1, h * 0.1);
+    // legs buckle
+    ctx.lineWidth = lw;
+    ctx.beginPath(); ctx.moveTo(cx, hipY); ctx.lineTo(cx - h * 0.18 * face, cy - h * 0.02); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx, hipY); ctx.lineTo(cx + h * 0.14 * face, cy - h * 0.02); ctx.stroke();
+    // torso
+    ctx.lineWidth = lw * 1.3;
+    ctx.beginPath(); ctx.moveTo(cx, hipY); ctx.lineTo(chestX, chestY); ctx.stroke();
+    // arms flail
+    ctx.lineWidth = lw * 0.85;
+    ctx.beginPath(); ctx.moveTo(chestX, chestY);
+    ctx.lineTo(chestX + h * 0.20 * face, chestY + h * 0.12); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(chestX, chestY);
+    ctx.lineTo(chestX - h * 0.16 * face, chestY + h * 0.10); ctx.stroke();
+    // head
+    ctx.beginPath(); ctx.arc(chestX + Math.sin(lean) * h * 0.18,
+      chestY - Math.cos(lean) * h * 0.12, h * 0.12, 0, 6.283); ctx.fill();
+    ctx.restore();
+    return true;
+  }
 
   function tint(hex, f) {
     const r = clamp(Math.round(parseInt(hex.slice(1, 3), 16) * f), 0, 255);
@@ -68,9 +204,14 @@
   // ------------------------------------------------------------ open/close
   async function openBattle(id) {
     watchId = id;
+    if (window.setMapAnimPaused) setMapAnimPaused(true);
     document.getElementById('battlewrap').style.display = 'flex';
     snapA = snapB = null;
     prevUnits.clear(); unitAnim.clear(); floaters = []; fxSeen.clear();
+    particles = []; trails.clear(); falling.clear(); prevUids.clear();
+    lastUnit.clear();
+    prevGenDown = []; prevMorale = [null, null]; moraleFlash = [0, 0];
+    resultAt = -1e9;
     lastPhase = ''; shake = 0;
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(poll, POLL_MS);
@@ -81,6 +222,7 @@
   }
   function closeBattle() {
     watchId = null;
+    if (window.setMapAnimPaused) setMapAnimPaused(false);
     document.getElementById('battlewrap').style.display = 'none';
     if (pollTimer) clearInterval(pollTimer);
     if (rafId) cancelAnimationFrame(rafId);
@@ -102,24 +244,59 @@
     if (snapB) {
       snapA = snapB;
       prevUnits.clear();
-      for (const u of snapA.d.units) prevUnits.set(u[0], [u[3], u[4]]);
+      for (const u of snapA.d.units) {
+        prevUnits.set(u[0], [u[3], u[4]]);
+        lastUnit.set(u[0], { side: u[1], type: u[2], hp: u[5], face: u[6] });
+      }
       prevGens = snapA.d.generals.map(g => ({ x: g.x, y: g.y, at: g.at }));
     }
     snapB = { d: b, time: performance.now() };
-    // unit anim transitions
+    // unit anim transitions + hurt/death detection
+    const liveUids = new Set();
     for (const u of b.units) {
+      liveUids.add(u[0]);
       const st = unitAnim.get(u[0]);
+      const wasHurt = st && st.anim === 3;
       if (!st || st.anim !== u[7]) unitAnim.set(u[0], { anim: u[7], since: performance.now() });
+      lastUnit.set(u[0], { side: u[1], type: u[2], hp: u[5], face: u[6] });
+      // transition into hurt (anim 3) -> blood burst
+      if (!wasHurt && u[7] === 3) {
+        spawnParticles(u[3], u[4], 9, { col: '#a82828', spd: 2.8, life: 0.55,
+          grav: 18, size: 1.2 });
+      }
     }
+    // vanished units = deaths: spawn a fall figure + blood at last known pos
+    for (const id of prevUids) {
+      if (liveUids.has(id) || falling.has(id)) continue;
+      const p = prevUnits.get(id);
+      const info = lastUnit.get(id);
+      if (p) {
+        spawnParticles(p[0], p[1], 16, { col: '#9e2222', spd: 3.4, life: 0.75,
+          grav: 16, size: 1.4 });
+        const face = info ? info.face : (id % 2 === 0 ? 1 : -1);
+        falling.set(id, { x: p[0], y: p[1], born: performance.now(), face,
+          side: info ? info.side : 0, type: info ? info.type : 0 });
+      }
+    }
+    prevUids = liveUids;
     if (unitAnim.size > 1600) {
-      const live = new Set(b.units.map(u => u[0]));
-      for (const k of unitAnim.keys()) if (!live.has(k)) unitAnim.delete(k);
+      for (const k of unitAnim.keys()) if (!liveUids.has(k)) unitAnim.delete(k);
     }
     // HUD
     document.getElementById('s0name').textContent = b.sides[0].name;
     document.getElementById('s1name').textContent = b.sides[1].name;
-    document.getElementById('s0morale').style.width = (b.sides[0].morale * 100) + '%';
-    document.getElementById('s1morale').style.width = (b.sides[1].morale * 100) + '%';
+    // morale bars (DOM tween via CSS) + flash on change
+    for (let s = 0; s < 2; s++) {
+      const bar = document.getElementById('s' + s + 'morale');
+      bar.style.width = (b.sides[s].morale * 100) + '%';
+      if (prevMorale[s] !== null && Math.abs(b.sides[s].morale - prevMorale[s]) > 0.004) {
+        moraleFlash[s] = performance.now();
+        bar.classList.remove('mflash');
+        void bar.offsetWidth;            // restart CSS animation
+        bar.classList.add('mflash');
+      }
+      prevMorale[s] = b.sides[s].morale;
+    }
     document.getElementById('s0count').textContent =
       `${b.sides[0].count}/${b.sides[0].initial} ⚔${b.sides[0].kills || 0}`;
     document.getElementById('s1count').textContent =
@@ -135,6 +312,8 @@
       ? `⚑ ${b.result.winner} holds the field — ` +
         `${b.result.kills[0] + b.result.kills[1]} casualties`
       : `${b.phase}  ·  ${b.t}s`;
+    if (b.result && resultAt < 0) resultAt = performance.now();
+    if (!b.result) resultAt = -1e9;
     // phase banner
     if (b.phase !== lastPhase) {
       lastPhase = b.phase;
@@ -151,20 +330,50 @@
       if (f.k === 'gate') {
         shake = Math.min(14, shake + 3 + (f.lvl || 1));
         spawnFloat(f.x, f.y, `GATE ${f.lvl}  µ↑`, '#ffd34d');
+        spawnParticles(f.x, f.y, 10, { col: '#ffd34d', spd: 4, life: 0.7,
+          grav: 6, size: 1.2, glow: true });
       } else if (f.k === 'rupture') {
         shake = Math.min(14, shake + 2);
         spawnFloat(f.x, f.y, 'τ≫C RUPTURE', '#ff5b5b');
+        spawnParticles(f.x, f.y, 16, { col: '#ff5b5b', spd: 5, life: 0.6,
+          grav: 8, size: 1.4, glow: true });
       } else if (f.k === 'seal') {
         spawnFloat(f.x, f.y, 'MERIDIAN SEALED', '#c9a6ff');
+        spawnParticles(f.x, f.y, 8, { col: '#c9a6ff', spd: 2.5, life: 0.7,
+          grav: -2, size: 1.0, glow: true });
       } else if (f.k === 'slain') {
         shake = Math.min(16, shake + 6);
+        spawnParticles(f.x, f.y, 18, { col: '#9e2222', spd: 3.4, life: 0.8,
+          grav: 16, size: 1.4 });
+        spawnParticles(f.x, f.y, 6, { col: '#d94444', spd: 2, life: 0.5,
+          grav: 10, size: 1.0 });
       } else if (f.k === 'tech') {
         shake = Math.min(12, shake + 1.5 + (f.pw || 0) * 0.2);
-      } else if (f.k === 'clash' && (f.pw || 0) > 6) {
-        shake = Math.min(10, shake + 1);
+        const tc = TR_COLOR[f.tr] || '#fff';
+        spawnParticles(f.x, f.y, 12, { col: tc, spd: 4.5, life: 0.6,
+          grav: 4, size: 1.2, glow: true });
+      } else if (f.k === 'clash') {
+        const pw = f.pw || 2;
+        spawnParticles(f.x, f.y, 5 + Math.min(8, pw), { col: '#b9a06a',
+          spd: 2 + pw * 0.2, life: 0.45, grav: 14, size: 0.9 });
+        if (pw > 6) { shake = Math.min(10, shake + 1);
+          spawnParticles(f.x, f.y, 5, { col: '#ffe9a8', spd: 3, life: 0.3,
+            grav: 2, size: 1.0, glow: true }); }
       }
     }
     for (const [k, exp] of fxSeen) if (exp < performance.now()) fxSeen.delete(k);
+    // generals going down/dead -> blood burst + tracked fall
+    b.generals.forEach((g, i) => {
+      const wasDown = prevGenDown[i] || false;
+      const isDown = !g.alive || g.down;
+      if (!wasDown && isDown) {
+        spawnParticles(g.x, g.y, 22, { col: '#9e2222', spd: 3.6, life: 0.9,
+          grav: 16, size: 1.5 });
+        falling.set('g' + i, { x: g.x, y: g.y, born: performance.now(),
+          face: g.face, side: g.side, gen: true, col: tint(SIDE[g.side], g.alive ? 1 : 0.75) });
+      }
+      prevGenDown[i] = isDown;
+    });
   }
 
   function spawnFloat(wx, wy, text, color) {
@@ -287,6 +496,7 @@
         ctx.arc(chestX, chestY, h * 0.55, -1.9 * face, 0.9 * face, face < 0);
         ctx.stroke();
       }
+      if (opt.trailId) pushTrail(opt.trailId, bx, by, opt._now || performance.now());
     }
     return { hip: [cx, hipY], chest: [chestX, chestY], head: [headX, headY],
              elF, handF, elB, handB, kneeF, footF, kneeB, footB };
@@ -323,115 +533,155 @@
     const since = st ? (now - st.since) : 999;
     const lw = Math.max(1, h * 0.1);
     ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineCap = 'round';
+    // hit reaction (anim 3): knockback shove + backward lean
+    let kbx = 0, lean = 0;
+    if (anim === 3) {
+      const k = clamp(since / 300, 0, 1);
+      const env = Math.sin(k * Math.PI);
+      kbx = env * h * 0.20 * -face;
+      lean = env * 0.4 * -face;
+    }
+    // strike lunge (anim 2)
     let lunge = 0;
     if (anim === 2) lunge = Math.sin(clamp(since / 350, 0, 1) * Math.PI) * h * 0.22 * face;
-    const cx = x + lunge, cy = y;
-    const hipY = cy - h * 0.42;
-    const chestY = cy - h * 0.72;
+    const cx = x + lunge + kbx, cy = y;
     // cavalry: horse under the rider
     if (type === 3 || type === 4) {
+      const bob = anim === 1 ? Math.sin(now / 95 + uid) * h * 0.03 : 0;
       ctx.save();
       ctx.strokeStyle = tint('#8a6b4a', side === 0 ? 1.05 : 0.95);
       ctx.lineWidth = h * 0.3;
       ctx.beginPath();
-      ctx.moveTo(cx - h * 0.42 * face, cy - h * 0.3);
-      ctx.lineTo(cx + h * 0.42 * face, cy - h * 0.3);
+      ctx.moveTo(cx - h * 0.42 * face, cy - h * 0.3 + bob);
+      ctx.lineTo(cx + h * 0.42 * face, cy - h * 0.3 + bob);
       ctx.stroke();
       ctx.lineWidth = lw * 0.9;
       const g = anim === 1 ? Math.sin(now / 90 + uid) * 0.5 : 0.15;
       for (const o of [-0.3, 0.3]) {
         ctx.beginPath();
-        ctx.moveTo(cx + o * h * face, cy - h * 0.3);
-        ctx.lineTo(cx + (o + g * 0.25) * h * face, cy);
-        ctx.stroke();
+        ctx.moveTo(cx + o * h * face, cy - h * 0.3 + bob);
+        ctx.lineTo(cx + (o + g * 0.25) * h * face, cy); ctx.stroke();
         ctx.beginPath();
-        ctx.moveTo(cx + o * h * face, cy - h * 0.3);
-        ctx.lineTo(cx + (o - g * 0.25) * h * face, cy);
-        ctx.stroke();
+        ctx.moveTo(cx + o * h * face, cy - h * 0.3 + bob);
+        ctx.lineTo(cx + (o - g * 0.25) * h * face, cy); ctx.stroke();
       }
       // horse head
       ctx.beginPath();
-      ctx.moveTo(cx + h * 0.42 * face, cy - h * 0.32);
-      ctx.lineTo(cx + h * 0.58 * face, cy - h * 0.5);
+      ctx.moveTo(cx + h * 0.42 * face, cy - h * 0.32 + bob);
+      ctx.lineTo(cx + h * 0.58 * face, cy - h * 0.5 + bob);
       ctx.lineWidth = h * 0.14; ctx.stroke();
       ctx.restore();
       // rider
-      ctx.beginPath(); ctx.moveTo(cx, cy - h * 0.34); ctx.lineTo(cx, chestY);
+      const chestY = cy - h * 0.72 + bob;
+      ctx.beginPath(); ctx.moveTo(cx, cy - h * 0.34 + bob); ctx.lineTo(cx, chestY);
       ctx.lineWidth = lw * 1.2; ctx.stroke();
       ctx.beginPath(); ctx.arc(cx, chestY - h * 0.1, h * 0.11, 0, 6.283); ctx.fill();
-      drawWeapon(ctx, cx, chestY, h, face, type, anim, since, lw);
-      if (anim === 3 && since < 260) hurtFlash(ctx, cx, cy - h * 0.4, h);
+      const tip = drawWeapon(ctx, cx, chestY, h, face, type, anim, since, lw);
+      if (tip && (anim === 2)) pushTrail(uid, tip[0], tip[1], now);
+      if (anim === 3 && since < 280) hurtFlash(ctx, cx, cy - h * 0.4, h);
       return;
     }
-    // legs
-    const ph = anim === 1 ? Math.sin(now / 110 + uid * 1.7) : 0.25;
-    ctx.lineWidth = lw;
-    ctx.beginPath(); ctx.moveTo(cx, hipY);
-    ctx.lineTo(cx + ph * h * 0.22 * face, cy); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(cx, hipY);
-    ctx.lineTo(cx - ph * h * 0.22 * face, cy); ctx.stroke();
-    // torso
+    // gait: stride phase, vertical bob, knee bend
+    const walking = anim === 1;
+    const cad = walking ? 120 : 1;
+    const ph = walking ? Math.sin(now / cad + uid * 1.7) : 0;
+    const bob = walking ? Math.abs(Math.cos(now / cad + uid * 1.7)) * h * 0.05
+                        : Math.sin(now / 600 + uid) * h * 0.01;   // idle breathing
+    const hipY = cy - h * 0.42 - bob;
+    const chestY = cy - h * 0.72 - bob;
+    const chestX = cx + Math.sin(lean) * h * 0.06;
+    // 2-segment legs with knees (back leg first)
+    const th = h * 0.24, sh = h * 0.22;
+    const drawLeg = (swing) => {
+      const hipA = swing * 0.55;
+      const kneeBend = Math.max(0, -swing) * 0.8 + (walking ? 0.14 : 0.06);
+      const kx = cx + Math.sin(hipA) * face * th;
+      const ky = hipY + Math.cos(hipA) * th;
+      const fa = hipA + kneeBend;
+      const fxp = kx + Math.sin(fa) * face * sh;
+      const fyp = ky + Math.cos(fa) * sh;
+      ctx.lineWidth = lw;
+      ctx.beginPath(); ctx.moveTo(cx, hipY); ctx.lineTo(kx, ky); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(kx, ky); ctx.lineTo(fxp, fyp); ctx.stroke();
+    };
+    drawLeg(ph); drawLeg(-ph);
+    // torso (with lean)
     ctx.lineWidth = lw * 1.3;
-    ctx.beginPath(); ctx.moveTo(cx, hipY); ctx.lineTo(cx, chestY); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx, hipY); ctx.lineTo(chestX, chestY); ctx.stroke();
+    // back arm counter-swing
+    ctx.lineWidth = lw * 0.85;
+    const armSwing = walking ? -ph * 0.6 : Math.sin(now / 500 + uid) * 0.12;
+    ctx.beginPath(); ctx.moveTo(chestX, chestY);
+    ctx.lineTo(chestX + Math.sin(armSwing) * face * h * 0.16,
+               chestY + Math.cos(armSwing) * h * 0.16); ctx.stroke();
     // head
-    ctx.beginPath(); ctx.arc(cx, chestY - h * 0.12, h * 0.12, 0, 6.283); ctx.fill();
+    ctx.fillStyle = col;
+    const headX = chestX + Math.sin(lean) * h * 0.05;
+    ctx.beginPath(); ctx.arc(headX, chestY - h * 0.12, h * 0.12, 0, 6.283); ctx.fill();
     // helmet hint for knights/spearmen
     if (type === 4 || type === 1) {
       ctx.fillStyle = tint(col, 1.3);
-      ctx.fillRect(cx - h * 0.12, chestY - h * 0.26, h * 0.24, h * 0.07);
+      ctx.fillRect(headX - h * 0.12, chestY - h * 0.26, h * 0.24, h * 0.07);
       ctx.fillStyle = col;
     }
-    drawWeapon(ctx, cx, chestY, h, face, type, anim, since, lw);
-    if (anim === 3 && since < 260) hurtFlash(ctx, cx, cy - h * 0.4, h);
+    const tip = drawWeapon(ctx, chestX, chestY, h, face, type, anim, since, lw);
+    if (tip && (anim === 2 || type === 5 || type === 1)) pushTrail(uid, tip[0], tip[1], now);
+    if (anim === 3 && since < 280) hurtFlash(ctx, cx, cy - h * 0.4, h);
   }
 
   function drawWeapon(ctx, cx, chestY, h, face, type, anim, since, lw) {
     ctx.save();
     ctx.lineWidth = Math.max(0.8, lw * 0.7);
     const striking = anim === 2 && since < 350;
-    const sp = striking ? Math.sin(clamp(since / 350, 0, 1) * Math.PI) : 0;
+    const sp = striking ? easeOutCubic(clamp(since / 350, 0, 1)) : 0;
+    // sp follows a 0->1 ease then holds; the swing envelope adds the return
+    const swing = striking ? Math.sin(clamp(since / 350, 0, 1) * Math.PI) : 0;
+    let tip = null;
     if (type === 2) {                    // archer: bow arc + arrow
       ctx.strokeStyle = '#c9a06a';
       ctx.beginPath();
       ctx.arc(cx + h * 0.28 * face, chestY, h * 0.3, -1.25, 1.25);
       ctx.stroke();
       if (striking) {
+        const ax = cx + (h * 0.3 + sp * h * 0.9) * face;
+        const ay = chestY - sp * h * 0.15;
         ctx.strokeStyle = '#eee';
         ctx.beginPath();
-        ctx.moveTo(cx + h * 0.3 * face, chestY);
-        ctx.lineTo(cx + (h * 0.3 + sp * h * 0.9) * face, chestY - sp * h * 0.15);
-        ctx.stroke();
+        ctx.moveTo(cx + h * 0.3 * face, chestY); ctx.lineTo(ax, ay); ctx.stroke();
+        tip = [ax, ay];
       }
     } else if (type === 5 || type === 1) { // pike/spear
       const len = type === 5 ? h * 1.15 : h * 0.85;
       ctx.strokeStyle = '#c9b08a';
       const dip = striking ? sp * 0.25 : 0;
+      const tx = cx + len * face, ty = chestY + h * 0.1 - len * (0.12 - dip);
       ctx.beginPath();
-      ctx.moveTo(cx - h * 0.1 * face, chestY + h * 0.1);
-      ctx.lineTo(cx + len * face, chestY + h * 0.1 - len * (0.12 - dip));
+      ctx.moveTo(cx - h * 0.1 * face, chestY + h * 0.1); ctx.lineTo(tx, ty);
       ctx.stroke();
+      tip = [tx, ty];
     } else if (type === 6) {              // siege crew: hammer
       ctx.strokeStyle = '#b0a090';
-      ctx.beginPath();
-      ctx.moveTo(cx, chestY);
-      ctx.lineTo(cx + h * 0.4 * face, chestY - h * 0.25 + sp * h * 0.4);
-      ctx.stroke();
+      const tx = cx + h * 0.4 * face, ty = chestY - h * 0.25 + sp * h * 0.4;
+      ctx.beginPath(); ctx.moveTo(cx, chestY); ctx.lineTo(tx, ty); ctx.stroke();
+      tip = [tx, ty];
     } else {                              // sword
       ctx.strokeStyle = '#d9e2ea';
       const a = striking ? lerp(-1.1, 0.9, sp) : -0.7;
-      ctx.beginPath();
-      ctx.moveTo(cx + h * 0.14 * face, chestY + h * 0.05);
-      ctx.lineTo(cx + (h * 0.14 + Math.cos(a) * h * 0.55) * face,
-                 chestY + h * 0.05 - Math.sin(a + 1.2) * h * 0.5);
-      ctx.stroke();
-      if (striking && sp > 0.5) {
-        ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+      const hx = cx + h * 0.14 * face, hy = chestY + h * 0.05;
+      const tx = cx + (h * 0.14 + Math.cos(a) * h * 0.55) * face;
+      const ty = chestY + h * 0.05 - Math.sin(a + 1.2) * h * 0.5;
+      ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(tx, ty); ctx.stroke();
+      tip = [tx, ty];
+      if (striking && swing > 0.5) {
+        ctx.strokeStyle = `rgba(255,255,255,${0.45 * swing})`;
+        ctx.lineWidth = lw * 0.5;
         ctx.beginPath();
         ctx.arc(cx, chestY, h * 0.5, -1.3 * face, 0.5 * face, face < 0);
         ctx.stroke();
       }
     }
     ctx.restore();
+    return tip;
   }
 
   function hurtFlash(ctx, x, y, h) {
@@ -623,13 +873,13 @@
     [ga, gb].forEach((g, i) => {
       const [fx, face] = positions[i];
       const col = SIDE[g.side];
-      drawDuelFighter(ctx, g, fx, baseY, fh, face, col, now, i === 0 ? x0 + 12 : x0 + pw - 12, i === 0 ? 'left' : 'right', y0, ph);
+      drawDuelFighter(ctx, g, fx, baseY, fh, face, col, now, i === 0 ? x0 + 12 : x0 + pw - 12, i === 0 ? 'left' : 'right', y0, ph, 'duel' + i);
     });
     // VS mark & floating annotations drawn by caller
     ctx.restore();
   }
 
-  function drawDuelFighter(ctx, g, fx, baseY, fh, face, col, now, barX, align, y0, ph) {
+  function drawDuelFighter(ctx, g, fx, baseY, fh, face, col, now, barX, align, y0, ph, trailId) {
     // aura by µ / gate
     const mu = g.mu || 1;
     if (mu > 1.05 || g.action === 'gate' || g.action === 'channel') {
@@ -651,7 +901,7 @@
       const pose = fighterPose(g, at, now);
       joints = drawFighter(ctx, fx, baseY, fh, face, pose,
         { color: col, weaponColor: '#e8eef2',
-          strikeTrail: g.action === 'strike' });
+          strikeTrail: g.action === 'strike', trailId, _now: now });
     }
     // conduit overlay on the body (G3 graph made visible)
     if (joints && g.edges) drawConduits(ctx, joints, g, now);
@@ -774,6 +1024,8 @@
   // ------------------------------------------------------------ render
   function render(now) {
     if (!snapB || watchId === null) return;
+    const dt = lastNow ? Math.min(0.05, (now - lastNow) / 1000) : 0;
+    lastNow = now;
     const b = snapB.d;
     // resize to CSS box
     const cssW = bc.clientWidth || 960, cssH = bc.clientHeight || 560;
@@ -795,7 +1047,7 @@
     if (shake > 0.3) {
       sx = (Math.random() - 0.5) * shake;
       sy = (Math.random() - 0.5) * shake;
-      shake *= 0.88;
+      shake *= 0.90;
     }
     ctx.save();
     ctx.translate(sx, sy);
@@ -822,11 +1074,22 @@
       const span = Math.max(30, snapB.time - snapA.time);
       alpha = clamp((now - snapB.time) / span, 0, 1);
     }
+    // ---- falling figures (dying transition before corpse appears)
+    const doneFalling = [];
+    for (const [id, fall] of falling) {
+      const h = fall.gen ? sc * 3.1 : sc * 2.2;
+      const col = fall.col || tint(SIDE[fall.side], (fall.gen ? 1 : TYPE_TINT[fall.type] * 0.62));
+      const cont = drawFalling(ctx, px(fall.x), py(fall.y), h, fall.face, col, fall.born, now);
+      if (!cont) doneFalling.push(id);
+    }
+    for (const id of doneFalling) falling.delete(id);
     // ---- corpses (persist under the living)
     for (const c of (b.corpses || [])) {
       const col = tint(SIDE[c[2]], 0.45);
       drawCorpse(ctx, px(c[0]), py(c[1]), sc * 1.9, c[2] === 0 ? 1 : -1, col);
     }
+    // ---- soldier weapon trails (under soldiers)
+    drawTrails(ctx, now, sc, id => id[0] !== 'g' && !id.startsWith('duel'));
     // ---- soldiers
     for (const u of b.units) {
       const prev = prevUnits.get(u[0]);
@@ -836,6 +1099,10 @@
     }
     // ---- field fx
     for (const f of b.fx) drawFx(ctx, f, px, py, sc, now);
+    // ---- particles (blood / dust / sparks)
+    updateParticles(dt, px, py, sc, now, ctx);
+    // ---- general weapon trails
+    drawTrails(ctx, now, sc, id => id[0] === 'g' || id.startsWith('duel'));
     // ---- generals
     b.generals.forEach((g, i) => {
       const prev = prevGens[i];
@@ -861,7 +1128,7 @@
         const pose = fighterPose(g, extrapolateAt(g), now);
         drawFighter(ctx, X, Y, h, g.face, pose,
           { color: SIDE[g.side], weaponColor: '#f1e6c8',
-            strikeTrail: g.action === 'strike' });
+            strikeTrail: g.action === 'strike', trailId: 'g' + i, _now: now });
         // banner crest
         ctx.fillStyle = '#f1c40f';
         ctx.beginPath();
@@ -886,45 +1153,69 @@
         ctx.setLineDash([]);
       }
     });
-    // ---- floaters
+    // ---- floaters (eased rise)
     floaters = floaters.filter(f => now - f.born < 1300);
     ctx.font = 'bold 10px Consolas, monospace';
     ctx.textAlign = 'center';
     for (const f of floaters) {
       const p = (now - f.born) / 1300;
-      ctx.globalAlpha = 1 - p;
+      const e = easeOutCubic(p);
+      ctx.globalAlpha = 1 - e;
       ctx.fillStyle = f.color;
-      ctx.fillText(f.text, px(f.x), py(f.y) - sc * 2.5 - p * 26);
+      const y = py(f.y) - sc * 2.5 - e * 34;
+      const scf = 0.85 + (1 - e) * 0.22;
+      ctx.save();
+      ctx.translate(px(f.x), y);
+      ctx.scale(scf, scf);
+      ctx.fillText(f.text, 0, 0);
+      ctx.restore();
     }
     ctx.globalAlpha = 1;
     // ---- duel cinema inset
     drawDuelInset(ctx, b, b.generals, W, H, now);
-    // ---- phase banner
+    // ---- phase banner (slide+scale tween)
     const ps = (now - phaseAt) / 1000;
     if (ps < 2.4 && phaseLabel) {
-      const a2 = ps < 0.3 ? ps / 0.3 : ps > 1.8 ? (2.4 - ps) / 0.6 : 1;
-      ctx.globalAlpha = clamp(a2, 0, 1);
+      const p = ps / 2.4;
+      const e = p < 0.18 ? easeOutBack(p / 0.18)
+              : p > 0.78 ? easeOutCubic((1 - p) / 0.22) : 1;
+      const alpha = clamp(p < 0.15 ? p / 0.15
+                        : p > 0.78 ? (1 - p) / 0.22 : 1, 0, 1);
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      const y = H * 0.55 - (1 - e) * H * 0.08;
+      const s = 0.92 + (1 - e) * 0.18;
+      ctx.translate(W / 2, y);
+      ctx.scale(s, s);
       ctx.font = 'bold 30px "Segoe UI", sans-serif';
       ctx.textAlign = 'center';
       ctx.fillStyle = lastPhase === 'rout' ? '#ffb26b' : '#e8d9a0';
       ctx.strokeStyle = 'rgba(8,12,18,0.85)';
       ctx.lineWidth = 5;
-      ctx.strokeText(phaseLabel, W / 2, H * 0.52);
-      ctx.fillText(phaseLabel, W / 2, H * 0.52);
-      ctx.globalAlpha = 1;
+      ctx.strokeText(phaseLabel, 0, 0);
+      ctx.fillText(phaseLabel, 0, 0);
+      ctx.restore();
     }
-    // ---- result overlay
+    // ---- result overlay (fade/scale in)
     if (b.result) {
-      ctx.fillStyle = 'rgba(6,10,14,0.35)';
+      const t = clamp((now - resultAt) / 900, 0, 1);
+      const e = easeOutCubic(t);
+      ctx.fillStyle = `rgba(6,10,14,${0.35 * e})`;
       ctx.fillRect(0, 0, W, H);
+      ctx.save();
+      ctx.globalAlpha = e;
+      const s = 0.9 + e * 0.1;
+      ctx.translate(W / 2, H * 0.5);
+      ctx.scale(s, s);
       ctx.font = 'bold 26px "Segoe UI", sans-serif';
       ctx.textAlign = 'center';
       ctx.fillStyle = '#f1c40f';
       ctx.strokeStyle = 'rgba(8,12,18,0.9)';
       ctx.lineWidth = 5;
       const txt = `⚑ ${b.result.winner} HOLDS THE FIELD`;
-      ctx.strokeText(txt, W / 2, H * 0.5);
-      ctx.fillText(txt, W / 2, H * 0.5);
+      ctx.strokeText(txt, 0, 0);
+      ctx.fillText(txt, 0, 0);
+      ctx.restore();
     }
     ctx.restore();
   }
